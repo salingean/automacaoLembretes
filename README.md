@@ -182,4 +182,4 @@ Para que a auditoria seja executada diariamente de forma autônoma:
 
 Desenvolvido por **Salin Gean**  
 E-mail: [salingeanestrela@gmail.com](mailto:salingeanestrela@gmail.com)  
-LinkedIn: [linkedin.com/in/salingean](https://www.linkedin.com/in/salingean)
+LinkedIn: [linkedin.com/in/salingeanestrela](https://www.linkedin.com/in/salingeanestrela)
