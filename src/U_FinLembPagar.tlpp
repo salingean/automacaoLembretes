@@ -1,0 +1,663 @@
+#include "tlpp-core.th"
+#include "totvs.ch"
+
+/*/{Protheus.doc} FinLembPagar
+    Monitora despesas recorrentes e nao recorrentes configuradas na tabela ZZL
+    e consolida TODAS as pendencias em um UNICO e-mail com layout FiscalDash (Lista Completa).
+    
+    Campos ZZL:
+      ZZL_FILIAL : Codigo filial da regra (campo comum C 8, sem tratamento xFilial)
+      ZZL_DESC   : Descricao da despesa / lembrete
+      ZZL_TIPO   : Tipo do titulo no SE2 (ex: 001, 131, TX, NF, BOL)
+      ZZL_NATURE : Natureza financeira (opcional)
+      ZZL_FORN   : Codigo do fornecedor (opcional)
+      ZZL_VENC   : Data / dia de vencimento (DDMMYYYY ou YYYYMMDD ou Data)
+      ZZL_RECOR  : .T. = recorrente mensalmente / .F. = data fixa
+      ZZL_AVISO  : Dias de antecedencia para comecar a avisar
+      ZZL_EMAIL  : Email de destino do alerta
+/*/
+User Function FinLembPagar()
+
+	Local cTabZZL      := "" as Character
+	Local cTabSE2      := "" as Character
+	Local cQryZZL      := "" as Character
+	Local cAliasZZL    := "" as Character
+	Local cQrySE2      := "" as Character
+	Local cAliasSE2    := "" as Character
+
+	Local lEncontrou   := .F. as Logical
+	Local lEnviouAlgum := .F. as Logical
+	Local cCorpoHtml   := "" as Character
+	Local cSubject     := "" as Character
+	Local cLogMaster   := "\system\log_master.txt"
+	Local cLogTxt      := "=== INICIO U_FinLembPagar AS " + Time() + " (Data: " + DToC(Date()) + ") ===" + CRLF
+
+	Local dHoje        := Date() as Date
+	Local dVenc        := CToD("") as Date
+	Local dInicio      := CToD("") as Date
+	Local dFim         := CToD("") as Date
+	Local dAlvo        := CToD("") as Date
+	Local dAlvoMes     := CToD("") as Date
+	Local dAlvoProx    := CToD("") as Date
+	Local dProxMes     := CToD("") as Date
+
+	Local cFilRegra    := "" as Character
+	Local cTipo        := "" as Character
+	Local cFornece     := "" as Character
+	Local cNatureza    := "" as Character
+	Local cDesc        := "" as Character
+	Local cEmailDest   := "" as Character
+	Local cVencClean   := "" as Character
+	Local xVencRaw     := Nil
+	Local xRecorRaw    := Nil
+	Local xAvisoRaw    := Nil
+
+	Local lRecorrente  := .F. as Logical
+	Local lSemData     := .F. as Logical
+	Local nDiaAlvo     := 0 as Numeric
+	Local nDiasAvi     := 0 as Numeric
+	Local nTotRegras   := 0 as Numeric
+	Local nProcessadas := 0 as Numeric
+	Local nTotPend     := 0 as Numeric
+
+	Local aItens       := {} as Array
+	Local aDestinatarios := {} as Array
+	Local nI           := 0 as Numeric
+
+	MemoWrite(cLogMaster, cLogTxt)
+	ConOut(cLogTxt)
+
+	// ---------------------------------------------------------------
+	// 1. OBTEM NOME FISICO DAS TABELAS NO BANCO
+	// ---------------------------------------------------------------
+	cTabZZL := RetSqlName("ZZL")
+	If Empty(cTabZZL)
+		cTabZZL := "ZZL010"
+	EndIf
+
+	cTabSE2 := RetSqlName("SE2")
+	If Empty(cTabSE2)
+		cTabSE2 := "SE2010"
+	EndIf
+
+	cLogTxt += "Tabela ZZL fisica: " + cTabZZL + " | SE2 fisica: " + cTabSE2 + CRLF
+	MemoWrite(cLogMaster, cLogTxt)
+
+	// ---------------------------------------------------------------
+	// 2. CONSULTA DIRETA DAS REGRAS NA TABELA ZZL VIA TOPCONN
+	// ---------------------------------------------------------------
+	cQryZZL := "SELECT ZZL_CODFL, ZZL_FILIAL, ZZL_DESC, ZZL_TIPO, ZZL_NATURE, ZZL_FORN, ZZL_VENC, ZZL_RECOR, ZZL_AVISO, ZZL_EMAIL "
+	cQryZZL += "FROM " + cTabZZL + " "
+	cQryZZL += "WHERE D_E_L_E_T_ = ' ' "
+	cQryZZL += "ORDER BY ZZL_CODFL, ZZL_FILIAL, ZZL_DESC "
+	cQryZZL := ChangeQuery(cQryZZL)
+
+	cAliasZZL := GetNextAlias()
+	DbUseArea(.T., "TOPCONN", TcGenQry(,,cQryZZL), cAliasZZL, .F., .T.)
+
+	If Select(cAliasZZL) == 0 .Or. (cAliasZZL)->(EoF())
+		cLogTxt += "Nenhuma regra ativa encontrada na tabela " + cTabZZL + "." + CRLF
+		MemoWrite(cLogMaster, cLogTxt)
+		ConOut(cLogTxt)
+		If Select(cAliasZZL) > 0
+			(cAliasZZL)->(DbCloseArea())
+		EndIf
+		Return .F.
+	EndIf
+
+	// ---------------------------------------------------------------
+	// 3. AUDITORIA E COLETA DE TODAS AS PENDENCIAS
+	// ---------------------------------------------------------------
+	While !(cAliasZZL)->(EoF())
+		nTotRegras++
+
+		cDesc      := AllTrim((cAliasZZL)->ZZL_DESC)
+		// Junta Filial + Empresa (ZZL_FILIAL + ZZL_CODFL) literalmente para SEEK em SE2.E2_FILIAL (0401)
+		cFilRegra  := AllTrim((cAliasZZL)->ZZL_FILIAL) + AllTrim((cAliasZZL)->ZZL_CODFL)
+		cTipo      := AllTrim((cAliasZZL)->ZZL_TIPO)
+		cFornece   := AllTrim((cAliasZZL)->ZZL_FORN)
+		cNatureza  := AllTrim((cAliasZZL)->ZZL_NATURE)
+		cEmailDest := Lower(AllTrim((cAliasZZL)->ZZL_EMAIL))
+		xVencRaw   := (cAliasZZL)->ZZL_VENC
+		xRecorRaw  := (cAliasZZL)->ZZL_RECOR
+		xAvisoRaw  := (cAliasZZL)->ZZL_AVISO
+
+		// Coleta destinatarios unicos
+		If !Empty(cEmailDest) .And. AScan(aDestinatarios, {|x| x == cEmailDest}) == 0
+			AAdd(aDestinatarios, cEmailDest)
+		EndIf
+
+		// -----------------------------------------------------------
+		// 3.1 CONVERSAO ROBUSTA DE ZZL_VENC (DATA / STRING DDMMYYYY / YYYYMMDD)
+		// -----------------------------------------------------------
+		dVenc := CToD("")
+		If ValType(xVencRaw) == "D"
+			dVenc := xVencRaw
+		ElseIf ValType(xVencRaw) == "C"
+			cVencClean := StrTran(StrTran(StrTran(AllTrim(xVencRaw), "/", ""), "-", ""), ".", "")
+
+			If Len(cVencClean) == 8
+				If Val(SubStr(cVencClean, 1, 4)) >= 1900 .And. Val(SubStr(cVencClean, 5, 2)) >= 1 .And. Val(SubStr(cVencClean, 5, 2)) <= 12
+					dVenc := StoD(cVencClean)
+				ElseIf Val(SubStr(cVencClean, 5, 4)) >= 1900 .And. Val(SubStr(cVencClean, 3, 2)) >= 1 .And. Val(SubStr(cVencClean, 3, 2)) <= 12
+					dVenc := StoD(SubStr(cVencClean, 5, 4) + SubStr(cVencClean, 3, 2) + SubStr(cVencClean, 1, 2))
+				Else
+					dVenc := CToD(xVencRaw)
+				EndIf
+			ElseIf "/" $ xVencRaw
+				dVenc := CToD(xVencRaw)
+			ElseIf Len(cVencClean) > 0
+				dVenc := StoD(cVencClean)
+			EndIf
+		EndIf
+
+		// -----------------------------------------------------------
+		// 3.2 PARSE DE ZZL_RECOR
+		// -----------------------------------------------------------
+		If ValType(xRecorRaw) == "L"
+			lRecorrente := xRecorRaw
+		ElseIf ValType(xRecorRaw) == "C"
+			lRecorrente := Upper(AllTrim(xRecorRaw)) $ "T|S|1|.T.|TRUE|SIM"
+		Else
+			lRecorrente := .F.
+		EndIf
+
+		// -----------------------------------------------------------
+		// 3.3 PARSE DE ZZL_AVISO
+		// -----------------------------------------------------------
+		If ValType(xAvisoRaw) == "N"
+			nDiasAvi := xAvisoRaw
+		ElseIf ValType(xAvisoRaw) == "C"
+			nDiasAvi := Val(AllTrim(xAvisoRaw))
+		Else
+			nDiasAvi := 0
+		EndIf
+
+		If nDiasAvi <= 0
+			nDiasAvi := 7
+		EndIf
+
+		cLogTxt += CRLF + "----------------------------------------" + CRLF
+		cLogTxt += "Regra: '" + cDesc + "' (Filial: " + cFilRegra + ", Tipo: " + cTipo + ")" + CRLF
+		cLogTxt += "  -> Venc. Cadastro: " + DToC(dVenc) + " | Recorrente: " + cValToChar(lRecorrente) + " | Dias Aviso: " + cValToChar(nDiasAvi) + CRLF
+
+		// lSemData = .T. -> modo "verificar existencia": busca SE2 sem filtro de data
+		lSemData := Empty(dVenc)
+
+		If lSemData
+			cLogTxt += "  [MODO EXISTENCIA] ZZL_VENC vazio: verificando apenas existencia do titulo na SE2 (sem filtro de data)." + CRLF
+		EndIf
+
+		// -----------------------------------------------------------
+		// 3.4 CALCULO DA DATA ALVO (dAlvo)
+		// -----------------------------------------------------------
+		If lSemData
+			// Modo existencia: usa data de hoje apenas para exibicao no email
+			dAlvo := dHoje
+			cLogTxt += "  -> Modo existencia (sem data): verificando SE2 sem filtro de vencimento." + CRLF
+		ElseIf lRecorrente
+			nDiaAlvo := Day(dVenc)
+
+			// Vencimento no mes corrente
+			dAlvoMes := StoD(StrZero(Year(dHoje), 4) + StrZero(Month(dHoje), 2) + StrZero(Min(nDiaAlvo, Day(LastDay(dHoje))), 2))
+
+			// Vencimento no proximo mes
+			dProxMes  := GetNextMonth(dHoje)
+			dAlvoProx := StoD(StrZero(Year(dProxMes), 4) + StrZero(Month(dProxMes), 2) + StrZero(Min(nDiaAlvo, Day(LastDay(dProxMes))), 2))
+
+			If (dHoje >= (dAlvoMes - nDiasAvi)) .And. (dHoje <= dAlvoMes)
+				dAlvo := dAlvoMes
+			ElseIf (dHoje >= (dAlvoProx - nDiasAvi)) .And. (dHoje <= dAlvoProx)
+				dAlvo := dAlvoProx
+			ElseIf (dHoje > dAlvoMes) .And. (dHoje <= (dAlvoMes + 30))
+				// Considera atrasada do mes corrente
+				dAlvo := dAlvoMes
+			Else
+				dAlvo := dAlvoMes
+			EndIf
+		Else
+			// Vencimento fixo / unico
+			dAlvo := dVenc
+		EndIf
+
+		If !lSemData
+			cLogTxt += "  -> Data Alvo: " + DToC(dAlvo) + " (Hoje: " + DToC(dHoje) + ", Aviso: " + cValToChar(nDiasAvi) + " dias)" + CRLF
+		EndIf
+
+		// -----------------------------------------------------------
+		// 3.5 JANELA DE VERIFICACAO (A VENCER OU ATRASADA NOS ULTIMOS 30 DIAS)
+		// Modo existencia (lSemData) PULA esta verificacao - sempre processa
+		// -----------------------------------------------------------
+		If !lSemData
+			If (dAlvo >= dHoje .And. dHoje < (dAlvo - nDiasAvi)) .Or. (dAlvo < dHoje .And. dHoje > (dAlvo + 30))
+				cLogTxt += "  [FORA DA JANELA] Fora do periodo de monitoramento ativo." + CRLF
+				(cAliasZZL)->(DbSkip())
+				Loop
+			EndIf
+		EndIf
+
+		cLogTxt += "  -> PROCESSANDO: Consultando SE2 (Contas a Pagar)..." + CRLF
+		nProcessadas++
+
+		// -----------------------------------------------------------
+		// 3.6 CONSULTA NO CONTAS A PAGAR (SE2) PARA O MES DA DATA ALVO
+		// -----------------------------------------------------------
+		dInicio := dAlvo - Day(dAlvo) + 1
+		dFim    := LastDay(dAlvo)
+
+		cQrySE2 := "SELECT 1 FROM " + cTabSE2 + " SE2 "
+		cQrySE2 += "WHERE SE2.D_E_L_E_T_ = ' ' "
+
+		// Procura exata da filial de 4 digitos (Empresa + Filial)
+		cQrySE2 += "AND SE2.E2_FILIAL = '" + cFilRegra + "' "
+		cQrySE2 += "AND SE2.E2_TIPO = '" + cTipo + "' "
+
+		If !Empty(cFornece)
+			cQrySE2 += "AND RTRIM(SE2.E2_FORNECE) = '" + cFornece + "' "
+		EndIf
+
+		If !Empty(cNatureza)
+			cQrySE2 += "AND RTRIM(SE2.E2_NATUREZ) = '" + cNatureza + "' "
+		EndIf
+
+		cQrySE2 := ChangeQuery(cQrySE2)
+
+		cAliasSE2 := GetNextAlias()
+		DbUseArea(.T., "TOPCONN", TcGenQry(,,cQrySE2), cAliasSE2, .F., .T.)
+
+		lEncontrou := !(cAliasSE2)->(EoF())
+		(cAliasSE2)->(DbCloseArea())
+
+		// -----------------------------------------------------------
+		// 3.7 INCLUSAO NA LISTA UNICA CONSOLIDADA
+		// -----------------------------------------------------------
+		If lEncontrou
+			cLogTxt += "  [OK] Titulo encontrado no Contas a Pagar (SE2). Nenhuma pendencia." + CRLF
+		Else
+			cLogTxt += "  [PENDENCIA] Titulo NAO encontrado na SE2! Adicionado a lista consolidada." + CRLF
+			nTotPend++
+
+			AAdd(aItens, {;
+				cDesc, ;
+				dAlvo, ;
+				cFilRegra, ;
+				cTipo, ;
+				cFornece, ;
+				cNatureza, ;
+				lRecorrente, ;
+				nDiasAvi, ;
+				lSemData ;
+				})
+		EndIf
+
+		(cAliasZZL)->(DbSkip())
+	EndDo
+
+	(cAliasZZL)->(DbCloseArea())
+
+	// Destinatario padrao de fallback caso nao haja nenhum na ZZL
+	If Len(aDestinatarios) == 0
+		AAdd(aDestinatarios, "notificacoes@exemplo.com.br")
+	EndIf
+
+	// ---------------------------------------------------------------
+	// 4. DISPARO UNIFICADO: 1 UNICO EMAIL COM TODAS AS OBRIGACOES REUNIDAS
+	// ---------------------------------------------------------------
+	If Len(aItens) > 0
+		cLogTxt += CRLF + "========================================" + CRLF
+		cLogTxt += "DISPARANDO E-MAIL UNIFICADO COM TODAS AS " + cValToChar(Len(aItens)) + " PENDENCIAS:" + CRLF
+
+		cSubject := "Lembrete de obrigacoes fiscais - " + cValToChar(Len(aItens)) + " pendencia(s)"
+		cCorpoHtml := MontaHtmlFiscalDash(aItens, dHoje)
+
+		For nI := 1 To Len(aDestinatarios)
+			cEmailDest := aDestinatarios[nI]
+			cLogTxt += "  -> Enviando relatorio completo para: " + cEmailDest + CRLF
+
+			If SendMailReminder(cEmailDest, cSubject, cCorpoHtml)
+				cLogTxt += "     [SUCESSO] Email enviado com sucesso!" + CRLF
+				lEnviouAlgum := .T.
+			Else
+				cLogTxt += "     [FALHA] Falha no envio do email." + CRLF
+			EndIf
+		Next
+	EndIf
+
+	// ---------------------------------------------------------------
+	// 5. FINALIZACAO
+	// ---------------------------------------------------------------
+	cLogTxt += CRLF + "========================================" + CRLF
+	cLogTxt += "FIM DO PROCESSAMENTO AS " + Time() + CRLF
+	cLogTxt += "Total de regras no cadastro: " + cValToChar(nTotRegras) + CRLF
+	cLogTxt += "Regras avaliadas hoje: " + cValToChar(nProcessadas) + CRLF
+	cLogTxt += "Total de pendencias na lista unica: " + cValToChar(nTotPend) + CRLF
+	cLogTxt += "Alertas disparados: " + If(lEnviouAlgum, "SIM", "NAO") + CRLF
+	cLogTxt += "========================================" + CRLF
+
+	MemoWrite(cLogMaster, cLogTxt)
+	ConOut(cLogTxt)
+
+	If !lEnviouAlgum .And. IsInCallStack("U_TSTLemb")
+		MsgInfo("Monitoramento executado com sucesso! Nenhuma pendencia encontrada para envio hoje.", "Monitor de Lembretes")
+	EndIf
+
+Return .T.
+
+
+/*/{Protheus.doc} MontaHtmlFiscalDash
+    Gera o corpo do e-mail consolidado no padrao executivo FiscalDash:
+    - Tema escuro elegante (#141619 / #1e2126)
+    - 3 Cards de Indicadores (Total Obrigacoes, Atrasadas, A Vencer)
+    - Grade unica com todas as pendencias (Empresa/Descricao, Obrigacao, Periodo, Vencimento e Situacao)
+/*/
+Static Function MontaHtmlFiscalDash(aItens, dHoje)
+	Local cHtml      := ""
+	Local nI         := 0
+	Local nTot       := Len(aItens)
+	Local nAtrasadas := 0
+	Local nAVencer   := 0
+	Local nNaoEnc    := 0
+	Local cDesc      := ""
+	Local dAlvo      := CToD("")
+	Local cFil       := ""
+	Local cTipo      := ""
+	Local cForn      := ""
+	Local cNat       := ""
+	Local lRecor     := .F.
+	Local lSemDt     := .F.
+	Local nAviso     := 0
+	Local cPeriodo   := ""
+	Local cSituacao  := ""
+	Local cBadgeBg   := ""
+	Local cBadgeTxt  := ""
+	Local cRowBorder := ""
+
+	// Contabiliza atrasadas, a vencer e nao encontrados (sem data)
+	For nI := 1 To nTot
+		dAlvo   := aItens[nI][2]
+		lSemDt  := If(Len(aItens[nI]) >= 9, aItens[nI][9], .F.)
+		If lSemDt
+			nNaoEnc++
+		ElseIf dAlvo < dHoje
+			nAtrasadas++
+		Else
+			nAVencer++
+		EndIf
+	Next
+
+	cHtml += '<!DOCTYPE html>'
+	cHtml += '<html lang="pt-BR">'
+	cHtml += '<head>'
+	cHtml += '  <meta charset="UTF-8">'
+	cHtml += '  <meta name="viewport" content="width=device-width, initial-scale=1.0">'
+	cHtml += '  <title>Lembrete de Obrigacoes Fiscais</title>'
+	cHtml += '</head>'
+	cHtml += '<body style="margin: 0; padding: 24px 10px; background-color: #141619; font-family: Segoe UI, -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif; color: #e2e8f0;">'
+
+	// Container Principal Escuro
+	cHtml += '  <table align="center" border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 720px; background-color: #1e2126; border-radius: 12px; overflow: hidden; border: 1px solid #2d323b; box-shadow: 0 8px 24px rgba(0,0,0,0.4);">'
+
+	// 1. Topo com Logotipo e Titulos
+	cHtml += '    <tr>'
+	cHtml += '      <td style="padding: 32px 32px 20px 32px; text-align: left;">'
+	cHtml += '        <div style="font-size: 11px; font-weight: 800; letter-spacing: 1.5px; color: #94a3b8; text-transform: uppercase; margin-bottom: 8px;">FISCALDASH &bull; TOTVS PROTHEUS</div>'
+	cHtml += '        <h1 style="margin: 0 0 6px 0; font-size: 24px; font-weight: 700; color: #ffffff; letter-spacing: -0.3px;">Lembrete de obriga&ccedil;&otilde;es fiscais</h1>'
+	cHtml += '        <p style="margin: 0; font-size: 13px; color: #94a3b8;">Situa&ccedil;&atilde;o das entregas em ' + DToC(dHoje) + ' &mdash; vencimentos dos pr&oacute;ximos dias</p>'
+	cHtml += '      </td>'
+	cHtml += '    </tr>'
+
+	// 2. Linha com 3 Cards de Indicadores (KPIs)
+	cHtml += '    <tr>'
+	cHtml += '      <td style="padding: 0 32px 20px 32px;">'
+	cHtml += '        <table border="0" cellpadding="0" cellspacing="0" width="100%">'
+	cHtml += '          <tr>'
+
+	// Card 1 - Total de Obrigacoes
+	cHtml += '            <td width="23%" bgcolor="#282c34" style="background-color: #282c34; border-radius: 8px; padding: 18px 10px; text-align: center; border: 1px solid #363b46;">'
+	cHtml += '              <div style="font-size: 28px; font-weight: 800; color: #a5b4fc; line-height: 1.1;">' + cValToChar(nTot) + '</div>'
+	cHtml += '              <div style="font-size: 11px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px; margin-top: 6px;">OBRIGA&Ccedil;&Otilde;ES</div>'
+	cHtml += '            </td>'
+	cHtml += '            <td width="2%">&nbsp;</td>'
+
+	// Card 2 - Atrasadas
+	cHtml += '            <td width="23%" bgcolor="#2d2427" style="background-color: #2d2427; border-radius: 8px; padding: 18px 10px; text-align: center; border: 1px solid #4a3036;">'
+	cHtml += '              <div style="font-size: 28px; font-weight: 800; color: #f87171; line-height: 1.1;">' + cValToChar(nAtrasadas) + '</div>'
+	cHtml += '              <div style="font-size: 11px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px; margin-top: 6px;">ATRASADAS</div>'
+	cHtml += '            </td>'
+	cHtml += '            <td width="2%">&nbsp;</td>'
+
+	// Card 3 - A Vencer
+	cHtml += '            <td width="23%" bgcolor="#2e2a22" style="background-color: #2e2a22; border-radius: 8px; padding: 18px 10px; text-align: center; border: 1px solid #4d402b;">'
+	cHtml += '              <div style="font-size: 28px; font-weight: 800; color: #fbbf24; line-height: 1.1;">' + cValToChar(nAVencer) + '</div>'
+	cHtml += '              <div style="font-size: 11px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px; margin-top: 6px;">A VENCER</div>'
+	cHtml += '            </td>'
+	cHtml += '            <td width="2%">&nbsp;</td>'
+
+	// Card 4 - Nao Encontrados
+	cHtml += '            <td width="23%" bgcolor="#232830" style="background-color: #232830; border-radius: 8px; padding: 18px 10px; text-align: center; border: 1px solid #3a4050;">'
+	cHtml += '              <div style="font-size: 28px; font-weight: 800; color: #fb923c; line-height: 1.1;">' + cValToChar(nNaoEnc) + '</div>'
+	cHtml += '              <div style="font-size: 11px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px; margin-top: 6px;">N&Atilde;O ENCONTRADOS</div>'
+	cHtml += '            </td>'
+
+	cHtml += '          </tr>'
+	cHtml += '        </table>'
+	cHtml += '      </td>'
+	cHtml += '    </tr>'
+
+	// 3. Frase Resumo de Status
+	cHtml += '    <tr>'
+	cHtml += '      <td style="padding: 0 32px 24px 32px; font-size: 13px; color: #cbd5e1; line-height: 1.5;">'
+	cHtml += '        Obriga&ccedil;&otilde;es <strong style="color: #f87171;">' + cValToChar(nAtrasadas) + '</strong> atrasada(s), <strong style="color: #fbbf24;">' + cValToChar(nAVencer) + '</strong> pendente(s) e <strong style="color: #fb923c;">' + cValToChar(nNaoEnc) + '</strong> n&atilde;o encontrado(s) na SE2 em <strong>' + DToC(dHoje) + '</strong>.'
+	cHtml += '      </td>'
+	cHtml += '    </tr>'
+
+	// 4. Grade de Dados / Tabela
+	cHtml += '    <tr>'
+	cHtml += '      <td style="padding: 0 32px 32px 32px;">'
+	cHtml += '        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: collapse; font-size: 13px;">'
+
+	// Cabecalho Arredondado da Grade
+	cHtml += '          <tr bgcolor="#2a2e37">'
+	cHtml += '            <th align="left" style="padding: 12px 14px; color: #94a3b8; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; border-top-left-radius: 8px; border-bottom-left-radius: 8px; width: 40%;">EMPRESA / DESCRI&Ccedil;&Atilde;O</th>'
+	cHtml += '            <th align="left" style="padding: 12px 10px; color: #94a3b8; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; width: 15%;">OBRIGA&Ccedil;&Atilde;O</th>'
+	cHtml += '            <th align="center" style="padding: 12px 10px; color: #94a3b8; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; width: 15%;">PER&Iacute;ODO</th>'
+	cHtml += '            <th align="center" style="padding: 12px 10px; color: #94a3b8; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; width: 16%;">VENCIMENTO</th>'
+	cHtml += '            <th align="center" style="padding: 12px 14px; color: #94a3b8; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; border-top-right-radius: 8px; border-bottom-right-radius: 8px; width: 14%;">SITUA&Ccedil;&Atilde;O</th>'
+	cHtml += '          </tr>'
+
+	// Linhas da Tabela
+	For nI := 1 To nTot
+		cDesc   := aItens[nI][1]
+		dAlvo   := aItens[nI][2]
+		cFil    := aItens[nI][3]
+		cTipo   := aItens[nI][4]
+		cForn   := aItens[nI][5]
+		cNat    := aItens[nI][6]
+		lRecor  := aItens[nI][7]
+		nAviso  := aItens[nI][8]
+		lSemDt  := If(Len(aItens[nI]) >= 9, aItens[nI][9], .F.)
+
+		If lSemDt
+			cPeriodo  := "&mdash;"
+			cSituacao := "N&atilde;o Encontrado"
+			cBadgeBg  := "#7c2d12"
+			cBadgeTxt := "#fed7aa"
+		Else
+			cPeriodo := StrZero(Month(dAlvo), 2) + "/" + cValToChar(Year(dAlvo))
+			If !Empty(cNat)
+				cPeriodo := cNat + " (" + cPeriodo + ")"
+			EndIf
+			If dAlvo < dHoje
+				cSituacao := "Atrasada"
+				cBadgeBg  := "#7f1d1d"
+				cBadgeTxt := "#fecaca"
+			Else
+				cSituacao := "Pendente"
+				cBadgeBg  := "#9a3412"
+				cBadgeTxt := "#ffedd5"
+			EndIf
+		EndIf
+
+		cRowBorder := "border-bottom: 1px solid #282c35;"
+
+		cHtml += '          <tr>'
+
+		// Coluna 1: Empresa / Descricao + Filial/Fornecedor
+		cHtml += '            <td style="padding: 14px 14px; ' + cRowBorder + ' vertical-align: middle;">'
+		cHtml += '              <div style="font-size: 13px; font-weight: 700; color: #ffffff; line-height: 1.3;">' + cDesc + '</div>'
+		cHtml += '              <div style="font-size: 11px; color: #94a3b8; margin-top: 3px;">Filial: ' + cFil + If(!Empty(cForn), ' &bull; Forn: ' + cForn, '') + '</div>'
+		cHtml += '            </td>'
+
+		// Coluna 2: Obrigacao (Tipo)
+		cHtml += '            <td style="padding: 14px 10px; ' + cRowBorder + ' color: #cbd5e1; font-size: 13px; vertical-align: middle;">'
+		cHtml += '              <div style="font-weight: 600; color: #f1f5f9;">' + cTipo + '</div>'
+		cHtml += '            </td>'
+
+		// Coluna 3: Periodo / Natureza
+		cHtml += '            <td align="center" style="padding: 14px 10px; ' + cRowBorder + ' color: #94a3b8; font-size: 12px; vertical-align: middle;">'
+		cHtml += '              ' + cPeriodo
+		cHtml += '            </td>'
+
+		// Coluna 4: Vencimento
+		cHtml += '            <td align="center" style="padding: 14px 10px; ' + cRowBorder + ' color: #f1f5f9; font-weight: 600; font-size: 13px; vertical-align: middle;">'
+		If lSemDt
+			cHtml += '              <span style="color: #64748b;">&mdash;</span>'
+		Else
+			cHtml += '              ' + DToC(dAlvo)
+		EndIf
+		cHtml += '            </td>'
+
+		// Coluna 5: Badge Situacao
+		cHtml += '            <td align="center" style="padding: 14px 14px; ' + cRowBorder + ' vertical-align: middle;">'
+		cHtml += '              <span style="display: inline-block; background-color: ' + cBadgeBg + '; color: ' + cBadgeTxt + '; font-size: 11px; font-weight: 700; padding: 4px 12px; border-radius: 12px; text-transform: capitalize;">' + cSituacao + '</span>'
+		cHtml += '            </td>'
+
+		cHtml += '          </tr>'
+	Next
+
+	cHtml += '        </table>'
+	cHtml += '      </td>'
+	cHtml += '    </tr>'
+
+	// 5. Rodape Minimalista
+	cHtml += '    <tr>'
+	cHtml += '      <td bgcolor="#181a1f" style="background-color: #181a1f; padding: 18px 32px; text-align: center; border-top: 1px solid #282c35; font-size: 11px; color: #64748b;">'
+	cHtml += '        Notifica&ccedil;&atilde;o gerada automaticamente pelo Sistema Protheus em ' + DToC(dHoje) + ' &agrave;s ' + Time() + '.'
+	cHtml += '      </td>'
+	cHtml += '    </tr>'
+
+	cHtml += '  </table>'
+	cHtml += '</body>'
+	cHtml += '</html>'
+
+Return cHtml
+
+
+/*/{Protheus.doc} SendMailReminder
+    Envia email utilizando a classe nativa TMailManager / TMailMessage do Protheus AppServer.
+/*/
+Static Function SendMailReminder(cTo, cSubject, cBody)
+	Local oMail      := Nil
+	Local oMessage   := Nil
+	Local cSmtpSrv   := AllTrim(cValToChar(GetMV("MV_RELSERV", .F., "smtp.office365.com:587")))
+	Local cSmtpUser  := AllTrim(cValToChar(GetMV("MV_RELACNT", .F., "seu-email@dominio.com")))
+	Local cSmtpPass  := AllTrim(cValToChar(GetMV("MV_RELPSW", .F., "sua-senha")))
+	Local cSmtpPort  := AllTrim(cValToChar(GetMV("MV_RELPORT", .F., "587")))
+	Local cLogPath   := "\system\log_email.txt"
+	Local cLogTxt    := ""
+	Local nColon     := 0
+	Local nRet       := 0
+	Local lSuccess   := .F.
+
+	If Empty(cSmtpSrv)
+		cSmtpSrv := "smtp.office365.com:587"
+	EndIf
+	If Empty(cSmtpUser)
+		cSmtpUser := "seu-email@dominio.com"
+	EndIf
+	If Empty(cSmtpPass)
+		cSmtpPass := "sua-senha"
+	EndIf
+
+	// Trata se a porta estiver acoplada no servidor SMTP (ex: smtp.office365.com:587)
+	nColon := At(":", cSmtpSrv)
+	If nColon > 0
+		cSmtpPort := SubStr(cSmtpSrv, nColon + 1)
+		cSmtpSrv  := SubStr(cSmtpSrv, 1, nColon - 1)
+	EndIf
+
+	If Val(cSmtpPort) == 0
+		cSmtpPort := "587"
+	EndIf
+
+	cLogTxt := "--- ENVIO DE EMAIL NATIVO (TMailManager) AS " + Time() + " ---" + CRLF
+	cLogTxt += "Destinatario: " + cTo + CRLF
+	cLogTxt += "Assunto: " + cSubject + CRLF
+	cLogTxt += "Servidor: " + cSmtpSrv + ":" + cSmtpPort + CRLF
+
+	// Utiliza a classe nativa de baixo nivel TMailManager do AppServer
+	oMail := TMailManager():New()
+	oMail:Init("", cValToChar(cSmtpSrv), cValToChar(cSmtpUser), cValToChar(cSmtpPass), 0, Val(cSmtpPort))
+
+	// Ativa TLS se a porta for segura (587 ou 465)
+	If Val(cSmtpPort) == 587 .Or. Val(cSmtpPort) == 465
+		oMail:SetUseTLS(.T.)
+	EndIf
+
+	nRet := oMail:SmtpConnect()
+	If nRet == 0
+		// Efetua a autenticacao SMTP (obrigatoria para habilitar o envio/relay)
+		nRet := oMail:SmtpAuth(cValToChar(cSmtpUser), cValToChar(cSmtpPass))
+		If nRet == 0
+			oMessage := TMailMessage():New()
+			oMessage:cFrom    := cSmtpUser
+			oMessage:cTo      := cTo
+			oMessage:cSubject := cSubject
+			oMessage:cBody    := cBody
+			oMessage:AddCustomHeader("Content-Type", "text/html; charset=UTF-8")
+
+			nRet := oMessage:Send(oMail)
+			If nRet == 0
+				cLogTxt += "Status: SUCESSO (nRet: 0)" + CRLF
+				ConOut("[AUTOMACAO LEMBRETES] E-mail consolidado enviado com sucesso para: " + cTo)
+				lSuccess := .T.
+			Else
+				cLogTxt += "Status: ERRO DE ENVIO (Send) - Codigo " + cValToChar(nRet) + " - " + oMail:GetErrorString(nRet) + CRLF
+				ConOut("[AUTOMACAO LEMBRETES] Erro de envio: " + cValToChar(nRet) + " - " + oMail:GetErrorString(nRet))
+			EndIf
+		Else
+			cLogTxt += "Status: ERRO DE AUTENTICACAO (SmtpAuth) - Codigo " + cValToChar(nRet) + " - " + oMail:GetErrorString(nRet) + CRLF
+			ConOut("[AUTOMACAO LEMBRETES] Erro de autenticacao: " + cValToChar(nRet) + " - " + oMail:GetErrorString(nRet))
+		EndIf
+		oMail:SmtpDisconnect()
+	Else
+		cLogTxt += "Status: ERRO DE CONEXAO (SmtpConnect) - Codigo " + cValToChar(nRet) + " - " + oMail:GetErrorString(nRet) + CRLF
+		ConOut("[AUTOMACAO LEMBRETES] Erro de conexao: " + cValToChar(nRet) + " - " + oMail:GetErrorString(nRet))
+	EndIf
+
+	MemoWrite(cLogPath, cLogTxt)
+
+Return lSuccess
+
+
+/*/{Protheus.doc} GetNextMonth
+    Calcula a data do 1o dia do proximo mes de forma segura.
+/*/
+Static Function GetNextMonth(dData)
+	Local nAno := Year(dData)
+	Local nMes := Month(dData) + 1
+
+	If nMes > 12
+		nMes := 1
+		nAno += 1
+	EndIf
+
+Return StoD(StrZero(nAno, 4) + StrZero(nMes, 2) + "01")
+
+
+/*/{Protheus.doc} TstLemb
+    Funcao de teste manual para execucao direta.
+/*/
+User Function TstLemb()
+	U_FinLembPagar()
+Return

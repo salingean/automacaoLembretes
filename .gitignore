@@ -1,0 +1,10 @@
+﻿# TOTVS TDS / VSCode Cache
+.vscode/.cache/
+.vscode/.advpl/
+.vscode/.linter/
+*.ptm
+
+# Logs e Temporarios
+*.log
+*.tmp
+log_*.txt
